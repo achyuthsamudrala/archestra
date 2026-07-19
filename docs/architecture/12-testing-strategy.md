@@ -2,6 +2,20 @@
 
 Archestra's `platform/` monorepo runs four largely independent test layers — backend unit/integration tests (Vitest + PGlite), frontend integration tests (Playwright + MSW), end-to-end tests (Playwright against a real deployed stack), and Rust checks (cargo) — plus two purpose-built linters (`drizzle-migration-linter`, the license/supply-chain scripts) and a separate performance-benchmark harness. This document covers how each layer is built, why it's built that way, and how Turborepo and GitHub Actions stitch them into the PR pipeline. For the agentic-eval harness (a different kind of "benchmark" entirely), see [AI Labs Benchmark](./13-ai-labs-benchmark.md).
 
+The two most detail-heavy layers — the backend's `clean`/`mocked` project split and e2e's WireMock-backed external-API mocking — are summarized below:
+
+```mermaid
+flowchart TB
+    subgraph Backend["Backend unit/integration (Vitest + PGlite)"]
+        BT["*.test.ts file"] -->|"no vi.mock/doMock/unmock/hoisted"| Clean["clean project<br/>isolate: false<br/>shared module cache per worker"]
+        BT -->|"uses vi.mock/doMock/hoisted"| Mocked["mocked project<br/>isolate: true<br/>full per-file isolation"]
+    end
+    subgraph E2E["End-to-end (Playwright vs. real stack)"]
+        Suite["e2e test suite"] --> WireMock["WireMock stub server<br/>(port 9092)<br/>fakes external LLM provider APIs"]
+        Suite --> RealBackend["Real Fastify backend + Postgres +<br/>Kubernetes-backed MCP runtime"]
+    end
+```
+
 ## Backend unit/integration tests: Vitest + PGlite
 
 Backend tests never mock the database. Every test file gets a real Postgres-compatible database — [`@electric-sql/pglite`](https://github.com/electric-sql/pglite), an in-memory WASM build of Postgres — migrated with the project's actual Drizzle migrations, and test code goes through real model methods (`platform/CLAUDE.md`, `.claude/skills/archestra-dev-backend-tests/SKILL.md`). This is a deliberate rejection of mocking the ORM/DB layer: a mocked query builder can't catch a bad `JOIN`, a missing index-backed constraint, or a Drizzle/Postgres type mismatch, and Archestra's model layer (`backend/src/models/`) is where most business-logic bugs actually live.
@@ -60,6 +74,15 @@ A separate suite from both backend Vitest and the full e2e suite, run via `pnpm 
 **Image reuse.** `platform/e2e-tests/playwright.config.ts` opens with a note that nothing under `e2e-tests/` is part of the Docker image being tested — CI's image-reuse cache key deliberately excludes the e2e test directory so an e2e-only change reuses a previously built platform image instead of triggering a full rebuild (`.github/workflows/platform-e2e-tests.yml`).
 
 **Merge-queue gating, not every push.** Both the heavy backend-unit-test shards and the full e2e suite are gated to run only in the merge queue or when a PR carries an explicit label (`run-unit-tests`, `run-e2e`) — not on every ordinary PR push. `.github/workflows/on-pull-requests.yml` documents the mechanism in detail: the job's `if` condition makes it report **skipped** under its own name on an unlabeled push, and GitHub treats a skipped check as satisfying a required status check, so the branch-protection gate stays green without actually running the suite — but on `merge_group` events the guard is always true, so the queue genuinely validates before merge. The comments explicitly warn against adding same-named "placeholder" twin jobs for non-matrix checks, because a skipped placeholder would also satisfy the required check on `merge_group` even when the *real* job fails — this pattern is called out as having previously let red e2e merge past the queue.
+
+```mermaid
+flowchart TD
+    A["PR push / merge_group event"] --> B{"merge_group event, or PR<br/>labeled run-unit-tests/run-e2e?"}
+    B -->|"No - ordinary PR push"| C["Job's if condition is false<br/>job reports skipped"]
+    C --> D["GitHub treats skipped check<br/>as satisfying the required check<br/>(gate stays green)"]
+    B -->|"Yes"| E["Job actually runs<br/>(backend-unit-tests shards, e2e suite)"]
+    E --> F["Real pass/fail result<br/>gates the merge queue"]
+```
 
 ## Rust checks
 

@@ -22,6 +22,33 @@ Auth on this surface is not a single mechanism — `mcp-gateway.utils.ts` implem
 
 Separately, session-cookie-authenticated (not Bearer-token) routes exist for the frontend's in-app "Apps" UI: `POST /api/mcp/:agentId` (`routes/mcp-proxy.ts`) and `POST /api/mcp/server/:mcpServerId` (`routes/mcp-server-proxy.ts`). Both dispatch through the same `McpClient` transport-selection code eventually, but they authenticate the browser session rather than a bearer token, and they are a distinct surface from the token-authed `/v1/mcp/:profileId` gateway — there is no literal `/mcp_proxy/:id` Bearer-token route in the codebase as of this writing; the closest analogues are these two session-authed routes.
 
+The sequence below traces a `tools/call` request through the token-authed gateway, from auth through dispatch to whichever backing the resolved tool has:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway as MCP Gateway<br/>(/v1/mcp/:profileId)
+    participant McpClient as McpClient
+    participant Remote as Remote MCP server<br/>(HTTP, serverUrl)
+    participant Pod as K8s-managed pod<br/>(local server)
+
+    Client->>Gateway: POST tools/call (Bearer token)
+    Gateway->>Gateway: Authenticate<br/>(team/user token, OAuth 2.1,<br/>client_credentials, authorization_code, or JWKS)
+    Gateway->>Gateway: Resolve tools/list, filter by RBAC<br/>(filterToolNamesByPermission)
+    Gateway->>McpClient: executeToolCallForOwner()
+    alt serverType = remote
+        McpClient->>Remote: HTTP request
+        Remote-->>McpClient: Tool result
+    else serverType = local
+        McpClient->>Pod: stdio (Attach) or streamable-http
+        Pod-->>McpClient: Tool result
+    else serverType = app
+        McpClient->>McpClient: In-process execution<br/>(no network transport)
+    end
+    McpClient-->>Gateway: Tool result
+    Gateway-->>Client: JSON-RPC response
+```
+
 ## K8s orchestrator design: pod-per-server
 
 The runtime manager lives at `platform/backend/src/k8s/mcp-server-runtime/` (not `backend/src/mcp-server-runtime/`), split across:
@@ -70,6 +97,22 @@ A related but distinct mechanism, interactive exec (used for debug shells, not t
 
 stdio is the default because it matches how the overwhelming majority of existing MCP servers are actually distributed and run today (a CLI process reading/writing JSON-RPC over stdin/stdout) — no server-side code change is required to run an off-the-shelf stdio MCP server inside Archestra's runtime. streamable-http is required for servers that are natively HTTP services (or need to support genuinely concurrent tool calls) since a serialized single-pipe transport would otherwise become a bottleneck. The tradeoff is transport-dependent request concurrency (1 for stdio vs. 4 for HTTP) and different infrastructure per server (no Service resource needed for stdio at all).
 
+```mermaid
+flowchart TB
+    Install["Local MCP server installed"] --> Deployment["Deployment (apps/v1)<br/>one per installed server<br/>container: mcp-server"]
+    Deployment --> NetPolicy["NetworkPolicy applied<br/>before Deployment is created"]
+    Deployment --> Secret["Secret<br/>(env vars marked type: secret)"]
+    Deployment --> Pod["Pod"]
+
+    Pod --> Transport{"Configured transport"}
+    Transport -- "stdio (default)" --> Attach["K8sAttachTransport:<br/>Attach class opens WebSocket<br/>directly to pod-attach subresource"]
+    Attach --> StdioLimit["ConnectionLimiter:<br/>concurrency limit 1"]
+
+    Transport -- "streamable-http" --> Service["K8s Service<br/>(ClusterIP in-cluster / NodePort local)<br/>default port 8080, path /mcp"]
+    Service --> HttpClient["StreamableHTTPClientTransport"]
+    HttpClient --> HttpLimit["Concurrency limit 4;<br/>session pinned to pod<br/>(McpHttpSessionModel)"]
+```
+
 ## OAuth / On-Behalf-Of (OBO) authentication
 
 This is Enterprise-tier code (`SPDX-License-Identifier: LicenseRef-Archestra-Enterprise`) under `platform/backend/src/services/identity-providers/enterprise-managed/`, and it solves a distinct problem from gateway auth: once a caller is authenticated *to the gateway*, an MCP server sometimes needs to call a third-party API (e.g. Microsoft Graph) *as that specific user*, without ever holding that user's actual password or a long-lived personal token.
@@ -81,6 +124,23 @@ This is Enterprise-tier code (`SPDX-License-Identifier: LicenseRef-Archestra-Ent
 - Consumed in `clients/mcp-client.ts::executeToolCallForOwner()`, and explicitly restricted to HTTP-based transports — stdio throws ("Enterprise-managed credentials require an HTTP-based MCP transport"), since injecting a per-request Authorization header only makes sense on a request/response transport, not a persistent stdio pipe.
 
 This backs `docs/pages/mcp-authentication.md`'s "Identity Provider Token Exchange" section and is configured per catalog entry via `internal_mcp_catalog.enterpriseManagedConfig` (jsonb).
+
+```mermaid
+flowchart LR
+    Call["Tool call needs to reach a<br/>third-party API as a specific user<br/>(executeToolCallForOwner, HTTP transport only)"] --> Broker["broker.ts:<br/>resolveEnterpriseTransportCredential()"]
+    Broker --> Resolver["assertion-resolver.ts:<br/>where does the identity assertion come from?"]
+    Resolver -- "agent's IdP = gateway-auth IdP" --> RawJwt["Pass through caller's<br/>raw JWT"]
+    Resolver -- "different IdP" --> StoredToken["resolveSessionExternalIdpToken:<br/>stored per-user session token"]
+    RawJwt --> Exchange["exchange.ts:<br/>exchangeEnterpriseManagedCredential()<br/>selects a strategy"]
+    StoredToken --> Exchange
+    Exchange -- "entra_obo" --> Entra["entra-obo-strategy.ts:<br/>JWT-bearer OBO exchange<br/>with IdP token endpoint"]
+    Exchange -- "okta_managed" --> Okta["okta_managed strategy"]
+    Exchange -- "rfc8693" --> Rfc["rfc8693 strategy"]
+    Entra --> Normalize["Normalize to<br/>{ headerName, headerValue }"]
+    Okta --> Normalize
+    Rfc --> Normalize
+    Normalize --> Inject["Inject header into<br/>upstream MCP-server request"]
+```
 
 ## Private registry & installation-request workflow
 

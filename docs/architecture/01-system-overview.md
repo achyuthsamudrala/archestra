@@ -60,30 +60,64 @@ Postgres database, all reachable behind one auth boundary:
 Nothing here is a separate product; they are views onto the same Postgres-backed backend, which is why
 the backend document is the one most other documents point back to.
 
+```mermaid
+flowchart TB
+    subgraph clients["Clients"]
+        chatui["Chat UI"]
+        extclients["External clients<br/>(Claude Code, Cursor, custom agents)"]
+    end
+
+    subgraph backend["Backend (Fastify) — the center of gravity"]
+        llmproxy["LLM Proxy<br/>provider adapters, cost limits, virtual keys"]
+        mcpgw["MCP Gateway<br/>tool auth, policy enforcement, logging"]
+        security["Security Layer<br/>RBAC · tool policies · Dual-LLM · Lethal Trifecta"]
+        identity["Identity & Access<br/>Better-Auth · SSO · RBAC"]
+        obs["Observability<br/>OTel traces · Prometheus metrics"]
+    end
+
+    db[("PostgreSQL<br/>+ pgvector")]
+    orchestrator["Kubernetes orchestrator<br/>MCP server pods · Dagger sandbox"]
+
+    chatui --> llmproxy
+    chatui --> mcpgw
+    extclients --> llmproxy
+    extclients --> mcpgw
+
+    llmproxy -.enforced by.-> security
+    mcpgw -.enforced by.-> security
+    llmproxy --> identity
+    mcpgw --> identity
+
+    llmproxy --> db
+    mcpgw --> db
+    mcpgw --> orchestrator
+
+    backend -.emits.-> obs
+```
+
 ## The two runtime processes
 
 At its simplest, a running Archestra instance is two Node.js processes plus Postgres plus (optionally)
 Kubernetes:
 
-```
-                 ┌─────────────────────────┐
- browser  ─────► │  frontend (Next.js)     │  port 3000
-                 │  platform/frontend      │
-                 └───────────┬─────────────┘
-                              │ generated API client (OpenAPI) + streaming fetch
-                              ▼
-                 ┌─────────────────────────┐        ┌───────────────────┐
- API clients ──► │  backend (Fastify)      │ ─────► │ PostgreSQL        │
- (Claude Code,   │  platform/backend       │        │ (+ pgvector for   │
-  Cursor, etc.)  │  port 9000              │        │  embeddings)      │
-                 │  metrics on port 9050   │        └───────────────────┘
-                 └───────────┬─────────────┘
-                              │ (when K8s configured)
-                              ▼
-                 ┌─────────────────────────┐
-                 │ Kubernetes namespace     │  one pod per local MCP server;
-                 │ (orchestrator)           │  Dagger engine for skill sandboxes
-                 └─────────────────────────┘
+```mermaid
+flowchart LR
+    browser["Browser"] -->|"HTTP"| frontend
+    apiclients["API clients<br/>(Claude Code, Cursor, etc.)"] -->|"HTTP"| backend
+
+    subgraph frontend["frontend (Next.js) — port 3000<br/>platform/frontend"]
+        direction TB
+        fe_note["generated API client (OpenAPI)<br/>+ streaming fetch"]
+    end
+
+    subgraph backend["backend (Fastify) — port 9000<br/>platform/backend"]
+        direction TB
+        be_note["metrics on port 9050"]
+    end
+
+    frontend -->|"generated API client<br/>+ streaming fetch"| backend
+    backend --> db[("PostgreSQL<br/>+ pgvector for embeddings")]
+    backend -.->|"when K8s configured"| k8s["Kubernetes namespace (orchestrator)<br/>one pod per local MCP server<br/>Dagger engine for skill sandboxes"]
 ```
 
 The backend is the system's center of gravity: it owns the database, the LLM proxy, the MCP gateway,
@@ -115,6 +149,33 @@ transparent-but-policed layer in that loop, not a new agentic runtime bolted on 
 3. The client sends the tool result back to the LLM proxy and repeats until the model produces a final
    answer.
 
+```mermaid
+sequenceDiagram
+    participant Client as Client<br/>(chat UI or external agent)
+    participant Proxy as LLM Proxy
+    participant Provider as LLM Provider
+    participant Gateway as MCP Gateway
+    participant Tool as Tool<br/>(remote server / K8s pod / archestra__*)
+
+    Client->>Proxy: chat request + tools list
+    Proxy->>Proxy: cost-limit & virtual-key checks
+    Proxy->>Provider: forwarded request
+    Provider-->>Proxy: tool_use / tool_calls
+    Proxy-->>Client: tool_use / tool_calls (passed through)
+
+    Client->>Gateway: POST /v1/mcp/:profileId<br/>Bearer archestraToken
+    Gateway->>Gateway: resolve tool surface,<br/>enforce tool-invocation &<br/>trusted-data policies
+    Gateway->>Tool: execute call
+    Tool-->>Gateway: result
+    Gateway->>Gateway: apply response modifiers, log
+    Gateway-->>Client: tool result
+
+    Client->>Proxy: tool result appended to conversation
+    Proxy->>Provider: forwarded request
+    Provider-->>Proxy: final answer
+    Proxy-->>Client: final answer
+```
+
 The in-product chat UI is just one such client: it drives this loop against the same public LLM proxy
 and MCP gateway surfaces that an external client (Claude Code, Cursor, a custom agent) would use. This
 is a deliberate design constraint — see the tradeoffs discussion in
@@ -139,8 +200,15 @@ The one architectural rule repeated in every corner of the backend
 (`platform/spec/architecture.md`, `platform/backend/architecture.md`, `platform/CLAUDE.md`) is a strict
 one-way layering:
 
-```
-routes → services → models → database
+```mermaid
+flowchart LR
+    routes["Routes<br/>parse/validate (Zod),<br/>serialize — no business logic"]
+    services["Services<br/>business logic,<br/>cross-model orchestration,<br/>transactions"]
+    models["Models<br/>the only Drizzle queries,<br/>one file per table"]
+    database[("Database")]
+
+    routes --> services --> models --> database
+    routes -.->|"single-model-call route"| models
 ```
 
 Routes parse/validate (Zod via `fastify-type-provider-zod`) and serialize; they hold no business logic

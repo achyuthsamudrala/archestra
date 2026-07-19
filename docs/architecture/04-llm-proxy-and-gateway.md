@@ -28,6 +28,42 @@ Inside `handleLLMProxy`, the pipeline runs in this order:
 
 The ordering matters: limits are checked before spend happens, not after; policy evaluation happens on the model's output, not the client's input, because tool invocation policy is about what the *model chose to call*, not what the client asked for. The pre-flight check (step 2) is a genuine gate — a request over budget gets a `402 Payment Required` and never reaches step 6.
 
+The sequence below shows the same nine steps as a request/response flow, including where the pre-flight budget check short-circuits everything downstream of it:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy as LLM Proxy<br/>(handleLLMProxy)
+    participant Limits as LimitValidationService
+    participant Guardrails as Guardrails<br/>(trusted-data / tool-invocation)
+    participant Adapter as Provider Adapter
+    participant Provider as Upstream Provider
+    participant Log as Interaction Log
+
+    Client->>Proxy: LLM request<br/>(virtual key / OAuth / JWT)
+    Proxy->>Proxy: 1. Authenticate caller,<br/>resolve provider credential
+    Proxy->>Limits: 2. checkLimitsBeforeRequest
+    alt over budget
+        Limits-->>Client: 402 Payment Required
+        Proxy->>Log: Persist Interaction (finally)
+    else within budget
+        Proxy->>Proxy: 3. Dynamic model routing<br/>(optional cheaper-model substitution)
+        Proxy->>Guardrails: 4. Trusted-data evaluation
+        Proxy->>Proxy: 5. TOON compression (optional)
+        Proxy->>Adapter: 6. execute() / executeStream()
+        Adapter->>Provider: Provider-native request
+        Provider-->>Adapter: Provider-native response
+        Adapter-->>Proxy: Parsed response / stream chunks
+        Proxy->>Guardrails: 7. Tool-invocation policy evaluation<br/>(on model's returned tool calls)
+        alt policy blocks a tool call
+            Proxy-->>Client: Refusal response
+        else allowed
+            Proxy-->>Client: 8. Response<br/>(native shape or reconstructed SSE)
+        end
+        Proxy->>Log: 9. Persist Interaction (finally)
+    end
+```
+
 ## Authenticating the caller, not just the key
 
 The LLM proxy's auth chain is separate from the session middleware described in [Backend Architecture](./02-backend.md); it's implemented inline in `handleLLMProxy`/`llm-proxy-auth.ts` and tries, in order:
@@ -67,6 +103,21 @@ The interfaces are defined once in `platform/backend/src/types/llm-provider.ts`:
 1. **OpenAI-compatible providers** — the large majority (DeepSeek, Groq, Mistral, xAI, Ollama, vLLM, OpenRouter, Perplexity, Cerebras, Zhipu AI, MiniMax) share one implementation via `createOpenAiCompatibleAdapterFactory` (`routes/proxy/adapters/openai-compatible-adapter.ts`), which wires the single `OpenAIRequestAdapter`/`OpenAIResponseAdapter`/`OpenAIStreamAdapter` set (`adapters/openai.ts`) with just a base-URL getter and client constructor per provider. Adding one of these providers is close to a config entry, not a new adapter implementation — `adapters/deepseek.ts` is a few lines.
 2. **Providers with a genuinely different wire format** get bespoke adapter classes (Anthropic, Azure, Bedrock) *and*, separately, a **translator module** used only by the Model Router: `anthropic-openai-translator.ts`, `bedrock-openai-translator.ts`, `cohere-openai-translator.ts`, `gemini-openai-translator.ts`. Native routes (`/v1/anthropic/...`) never invoke the translators — they pass Anthropic's own shape straight through end to end. The translators exist specifically for the Model Router, which accepts one OpenAI-shaped request and must be able to route it to a non-OpenAI-shaped provider.
 
+```mermaid
+flowchart LR
+    subgraph Native["Provider-native routes (/v1/openai/..., /v1/anthropic/..., etc.)"]
+        OpenAiCompat["OpenAI-compatible providers<br/>(DeepSeek, Groq, Mistral, xAI, Ollama, ...)"] --> SharedAdapter["Shared OpenAI adapter set<br/>(createOpenAiCompatibleAdapterFactory)"]
+        Bespoke["Bespoke-format providers<br/>(Anthropic, Azure, Bedrock)"] --> BespokeAdapter["Provider-specific adapter classes"]
+    end
+    SharedAdapter --> ProviderA["Provider<br/>(native wire format, end to end)"]
+    BespokeAdapter --> ProviderB["Provider<br/>(native wire format, end to end)"]
+
+    subgraph Router["Model Router (opt-in, cross-provider)"]
+        ModelRouter["OpenAI-shaped request<br/>(/v1/model-router/...)"] --> Translator["Translator module<br/>(anthropic-openai, bedrock-openai,<br/>cohere-openai, gemini-openai)"]
+    end
+    Translator --> ProviderC["Target provider<br/>(translated to its native shape)"]
+```
+
 ### Tool-call format translation (Model Router only)
 
 `anthropic-openai-translator.ts` is the clearest example of the tool-call mapping problem: OpenAI's `tool_calls[].function.{name, arguments}` (a JSON string) becomes Anthropic's `content[].{type:"tool_use", id, name, input}` (a JSON object) on the way in, and Anthropic `tool_use` content blocks become OpenAI `tool_calls` with `arguments: JSON.stringify(block.input)` on the way back out. OpenAI's `tool` role message (keyed by `tool_call_id`) becomes an Anthropic `user` message containing a `tool_result` content block keyed by `tool_use_id`. `tool_choice: "required"` maps to Anthropic's `{type: "any"}`; a named-function choice maps to `{type: "tool", name}`. This translation exists in exactly one direction of use — OpenAI-shaped Model Router request → target provider's native shape, and native response → OpenAI-shaped response — because the Model Router's contract to callers is "you always speak OpenAI wire format, we speak whatever the destination needs."
@@ -87,6 +138,20 @@ Per the [tool-execution model described in the platform's own contributor guide]
 - **Streaming**: the same `evaluatePolicies` call runs once the full stream has been accumulated (`streamAdapter.state.toolCalls`). But because blocking a tool call *after* it has already been streamed to the client would be too late, the handler pre-checks each tool name's *blocking* policy (`ToolInvocationPolicyModel.hasBlockingPolicy`, cached in an `LRUCacheManager` keyed `${agentId}:${toolName}:${contextIsTrusted}`, 500 entries / 60s TTL) as each tool-call chunk arrives. A tool with no blocking policy streams its call immediately (important for low-latency MCP Apps UI that render as tool calls arrive); the moment one tool call in the response is found to have a blocking policy, the handler flips to buffering *all* subsequent tool-call chunks in `streamAdapter.state.rawToolCallEvents` instead of writing them, so a later block decision can still discard them before they reach the client. Once the stream ends and the full policy evaluation completes, buffered events are either flushed (allowed) or discarded and replaced with a synthetic refusal SSE event (`streamAdapter.formatCompleteTextSSE`).
 
 This is the concrete mechanism behind the platform-wide rule that "tool invocation policies and trusted data policies are still enforced by the proxy" even though the proxy itself never calls the tool.
+
+The streaming case's buffering decision is per-tool-name, made as each chunk arrives, not a blanket policy:
+
+```mermaid
+flowchart TB
+    Chunk["Tool-call chunk arrives<br/>while streaming"] --> Check{"Does this tool name have<br/>a blocking policy?<br/>(hasBlockingPolicy, cached)"}
+    Check -- "no" --> StreamNow["Write chunk to client<br/>immediately"]
+    Check -- "yes" --> Buffer["Flip to buffering:<br/>hold this and all subsequent<br/>tool-call chunks<br/>(state.rawToolCallEvents)"]
+    StreamNow --> End["Stream ends"]
+    Buffer --> End
+    End --> Evaluate["evaluatePolicies() on full<br/>accumulated tool calls"]
+    Evaluate -- "allowed" --> Flush["Flush buffered chunks<br/>to client"]
+    Evaluate -- "blocked" --> Discard["Discard buffered chunks;<br/>send synthetic refusal SSE event"]
+```
 
 ## Virtual keys, cost limits, and dynamic model routing
 

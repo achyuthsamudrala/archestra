@@ -28,6 +28,32 @@ Backend (Fastify, port 9000)          Frontend (Next.js, port 3000)
 - **Visualization**: Grafana (port 3002) is provisioned with all three datasources (`platform/dev/grafana/datasources/datasources.yml`) plus pre-built dashboards (`platform/dev/grafana/dashboards/*.json`: `genai-observability`, `agent-sessions`, `application-metrics`, `mcp-monitoring`, `rag-knowledge-base`).
 - **Errors**: Sentry is a parallel, independent sink for exceptions (backend via `@sentry/node` + `@sentry/opentelemetry`, frontend via `@sentry/nextjs`). See "Sentry as a second, filtered sink" below.
 
+The diagram below summarizes the pipeline described above, including the metrics path that bypasses the OTel Collector entirely:
+
+```mermaid
+flowchart TB
+    subgraph Backend["Backend (Fastify, port 9000)"]
+        SDK["OTel Node SDK"]
+        Metrics["prom-client<br/>/metrics on :9050<br/>(separate Fastify instance)"]
+    end
+    subgraph Frontend["Frontend (Next.js, port 3000)"]
+        SentryFE["Sentry (browser + edge)"]
+    end
+
+    SDK -->|"traces (OTLP/gRPC :4317)"| Collector["OTel Collector<br/>(dev/otel-collector-config.yaml)"]
+    SDK -->|"logs (OTLP/HTTP :4318)"| Collector
+    SentryFE -->|"error events"| Sentry["Sentry"]
+
+    Collector -->|traces| Tempo["Tempo :4317"]
+    Collector -->|"logs (native OTLP)"| Loki["Loki :3100"]
+
+    Prometheus["Prometheus"] -->|"scrapes :9050 directly"| Metrics
+
+    Tempo --> Grafana["Grafana :3002<br/>(Prometheus + Tempo + Loki datasources)"]
+    Loki --> Grafana
+    Prometheus --> Grafana
+```
+
 Locally the whole stack is a single Tilt resource: `tilt trigger observability` (or the equivalent `docker compose -f platform/dev/docker-compose.observability.yml up -d`) starts Tempo, Loki, the OTel Collector, Prometheus, and Grafana together. Unlike the backend/frontend/database resources, `observability` is declared with `auto_init=False` in `platform/dev/Tiltfile.integrations` — it does not start automatically with `tilt up`, since most day-to-day development doesn't need the full trace/metrics UI.
 
 ## What gets traced: LLM and MCP spans
@@ -85,6 +111,19 @@ Sentry is wired into the same OTel pipeline rather than as an unrelated SDK bolt
 - The OTLP path (Tempo/Grafana, the customer-facing pipeline) is wrapped in an `AgentSpanFilterProcessor` that only forwards spans carrying `route.category` — i.e. Archestra's own GenAI/MCP spans — unless `ARCHESTRA_OTEL_VERBOSE_TRACING=true`. This keeps the Tempo pipeline focused on agent-observability spans customers actually query, instead of every raw HTTP/DB span.
 - `SentrySampler` and `SentryPropagator` replace the default OTel sampler/propagator when Sentry is enabled, so Sentry's own sampling/trace-continuity rules govern the shared span stream.
 - Error classification is centralized in `observability/error-tracking-policy.ts`, shared by both the Sentry `beforeSend` filter and PostHog capture paths, so the two sinks agree on what counts as noise (expected 4xx, known upstream 502/504/529 conditions, a customer's own MCP server being unreachable) versus a real incident worth paging on (grouped by a stable fingerprint, e.g. `db-transient` + error code, so one outage doesn't fragment into one issue per failed query).
+
+The diagram below shows how a single `NodeSDK` instance, via its two `spanProcessors`, produces both the unfiltered Sentry stream and the filtered customer-facing OTLP stream from the same underlying spans:
+
+```mermaid
+flowchart LR
+    Spans["All spans<br/>(HTTP, pg, DNS, net, undici + Archestra spans)"] --> NodeSDK["NodeSDK<br/>spanProcessors[]"]
+
+    NodeSDK --> SentryProc["SentrySpanProcessor<br/>(unfiltered)"]
+    NodeSDK --> FilterProc["AgentSpanFilterProcessor<br/>(keeps only route.category spans,<br/>unless ARCHESTRA_OTEL_VERBOSE_TRACING=true)"]
+
+    SentryProc --> Sentry["Sentry<br/>(internal debugging)"]
+    FilterProc --> OTLP["OTLP exporter"] --> Collector["OTel Collector"] --> TempoGrafana["Tempo / Grafana<br/>(customer-facing pipeline)"]
+```
 
 ## Design Decisions & Tradeoffs
 

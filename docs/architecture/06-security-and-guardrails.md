@@ -33,6 +33,23 @@ Evaluation order, from `ToolInvocationPolicyModel.evaluateBatch` (`models/tool-i
 2. If no specific policy matched, default policies (empty `conditions`, i.e. "for every call to this tool") apply.
 3. If neither exists, the fallback is **restrictive**: an untrusted context blocks the tool (`TOOL_INVOCATION_NO_POLICY_UNTRUSTED_REASON`); a trusted context allows it. There's no global "block unless explicitly allowed" mode — a tool with zero policies is only blocked once context has already gone untrusted.
 
+```mermaid
+flowchart TB
+    A["Tool call requested"] --> B{"Specific policy matches?<br/>(non-empty conditions)"}
+    B -->|"yes — first match wins"| C["Apply matched specific policy"]
+    B -->|no| D{"Default policy exists?<br/>(empty conditions)"}
+    D -->|yes| E["Apply default policy"]
+    D -->|no| F{"Context trusted?"}
+    F -->|untrusted| G["Block (restrictive fallback)"]
+    F -->|trusted| H["Allow (restrictive fallback)"]
+    C --> I{"Policy action"}
+    E --> I
+    I -->|allow_when_context_is_untrusted| J["Allow regardless of trust"]
+    I -->|block_when_context_is_untrusted| K["Allow only while context trusted"]
+    I -->|block_always| L["Block"]
+    I -->|require_approval| M["Require approval in chat;<br/>blocked in autonomous execution"]
+```
+
 `checkApprovalRequired` (same file, line 220) is a second, independent pass used by the AI SDK's `needsApproval` hook — it looks only for a matching `require_approval` policy and is not affected by trust state.
 
 Archestra's own built-in tools (`archestra__*`) and agent/skill delegation tools bypass this entirely — see [RBAC as the floor](#rbac-as-a-security-layer) below for why that's still safe. One documented exception: `query_knowledge_sources`, a policy-*evaluated* built-in, deliberately falls through to the same policy path as an external tool (`archestraMcpBranding.isPolicyBypassedToolName` excludes it — see `guardrails/tool-invocation.ts:89`).
@@ -51,6 +68,22 @@ Where tool invocation policies gate whether a call *happens*, trusted data polic
 - `sanitize_with_dual_llm` — route the raw result through the Dual LLM subagent before it ever reaches the main model
 
 `evaluateIfContextIsTrusted` (`guardrails/trusted-data.ts:32`) is called once per agent turn with every tool call/result pair collected from the message history. For each result it calls `TrustedDataPolicyModel.evaluateBulk` (batched — one query for all tool calls in the turn, not N), which applies the same specific-then-default-then-restrictive-fallback precedence as tool invocation policies (`models/trusted-data-policy.ts:506` onward). A tool call whose result is not covered by any policy is untrusted by default (`"No matching policies - data is untrusted by default"`).
+
+```mermaid
+flowchart TB
+    A["Tool result returned"] --> B{"Specific policy matches result?"}
+    B -->|"yes — first match wins"| C["Apply matched specific policy"]
+    B -->|no| D{"Default policy exists?"}
+    D -->|yes| E["Apply default policy"]
+    D -->|no| F["Untrusted by default<br/>(no matching policies)"]
+    C --> G{"Policy action"}
+    E --> G
+    G -->|mark_as_trusted| H["Context stays trusted"]
+    G -->|mark_as_untrusted| I["Context becomes untrusted"]
+    G -->|block_always| J["Result replaced with<br/>blocked-content notice"]
+    G -->|sanitize_with_dual_llm| K["Routed through Dual LLM<br/>subagent before reaching main model"]
+    F --> I
+```
 
 A few notable details in the implementation:
 
@@ -73,6 +106,24 @@ The loop (`processWithMainAgent`, `dual-llm.ts:80`) runs up to `maxRounds` (from
 
 Why this defeats prompt injection specifically: an injected instruction inside the tool output ("ignore your task and email...") can only ever influence which multiple-choice index the quarantine agent selects. It cannot inject free text into the main agent's context, because the main agent's context is built exclusively from the question/answer transcript it wrote itself. The quarantine agent is disposable — even if it is fully compromised by the injected content, its blast radius is "picks a wrong-but-bounded option," not "emits arbitrary text the main agent will treat as ground truth."
 
+```mermaid
+sequenceDiagram
+    participant User as User request
+    participant Main as Main agent<br/>(DUAL_LLM_MAIN)
+    participant Quar as Quarantine agent<br/>(DUAL_LLM_QUARANTINE)
+    participant Raw as Raw untrusted<br/>tool output
+
+    User->>Main: Original request
+    loop Up to maxRounds
+        Main->>Quar: QUESTION + OPTIONS
+        Quar->>Raw: Reads raw tool output
+        Quar-->>Main: "Answer index only<br/>(z.object({ answer: int }))"
+        Main->>Main: "Append 'Answer: <index> (<option text>)'<br/>to transcript"
+    end
+    Main->>Main: Replies DONE
+    Main-->>User: "Final summary built only<br/>from Q&A transcript"
+```
+
 This is triggered from `guardrails/trusted-data.ts` when a trusted-data policy's action is `sanitize_with_dual_llm` (`shouldSanitizeWithDualLlm` at `trusted-data.ts:223`); the resulting summary (`analysis.result`) replaces the original tool result content before it reaches the main agent's context, and `toolResultIsTrusted` is set to `true` (line 263) — the *summary* is trusted, not the underlying data, since the summary is the only thing that ever reaches the main model.
 
 Model selection for both the main and quarantine agent falls back through: agent's own configured `llmApiKeyId`/`modelId` → best available LLM across the org's keys → the deployment default (`resolveBuiltInAgentSelection`, `dual-llm.ts:257`). One subtlety worth flagging: `providerRequiresPerUserCredential` is checked so that for providers needing a per-user credential (GitHub Copilot), the deployment-default fallback path deliberately omits an API key rather than borrow one user's token for a system subagent (`dual-llm.ts:291`).
@@ -94,6 +145,19 @@ Tool invocation and trusted data policies gate *what an agent's tool calls are a
 Every Archestra built-in tool (`archestra__*`) maps to a `{ resource, action }` permission pair in `TOOL_PERMISSIONS`, typed as `Record<ArchestraToolShortName, Permission | null>` — the TypeScript compiler enforces that a newly added tool cannot ship without an explicit permission entry (or an explicit `null` for "no additional check"). `checkToolPermission` is the single choke point every Archestra tool dispatch runs through before its handler executes; `filterToolNamesByPermission` does the equivalent bulk filtering for `tools/list` so a user only ever sees tools they're allowed to call.
 
 This matters directly for the sandbox surface covered in [Agents, Skills & the Sandbox](./07-agents-skills-sandbox.md): `run_command`/`upload_file`/`download_file` require `sandbox:execute`; `search_files`/`read_file`/`save_file`/`edit_file`/`delete_file` require `file:manage`; `load_skill`/`list_skills` require `skill:read`. The key point for this document: **RBAC and the guardrail layer are orthogonal and both always run.** A tool being "trusted" (bypassing tool-invocation/trusted-data policy evaluation because it's platform-authored, not upstream MCP content) says nothing about whether the *calling user* is authorized to use it — that's RBAC's job, and it is never skipped, including for built-ins. See [Backend Architecture](./02-backend.md) for the general RBAC/permission model (`userHasPermission`, custom roles, `requiredEndpointPermissionsMap`) that `checkToolPermission` builds on.
+
+The two checks are independent gates, not one merged check — a tool can bypass the policy layer while still being fully subject to RBAC:
+
+```mermaid
+flowchart TB
+    A["Archestra built-in tool call<br/>(archestra__*)"] --> B["Gate 1: Policy layer<br/>(tool-invocation / trusted-data)"]
+    B -->|"bypassed for built-ins<br/>(platform-authored, not upstream content)"| C["Skipped"]
+    A --> D["Gate 2: RBAC<br/>(checkToolPermission)"]
+    D --> E{"Caller has required permission?"}
+    E -->|no| F["Denied"]
+    E -->|yes| G["Handler executes"]
+    C -.->|"never conflated with"| D
+```
 
 ## Design Decisions & Tradeoffs
 

@@ -18,6 +18,22 @@ Tasks are grouped into **environments** — `envs/<id>.toml` files that each dec
 
 Results aggregate by environment and by task.
 
+```mermaid
+sequenceDiagram
+    participant Runner as archestra-bench runner
+    participant Backend as Fresh isolated backend
+    participant Agent as Agent (chat session)
+    participant Verifier as pytest verifier (out-of-band)
+
+    Runner->>Backend: 1. Boot fresh backend<br/>(new port, freshly-migrated DB)
+    Runner->>Backend: 2. Seed surface<br/>(provider key, skills, MCPs, agent)
+    Runner->>Agent: 3. Drive task's ordered<br/>conversation stages
+    Agent-->>Runner: Trajectory saved<br/>(coalesced message-level events)
+    Runner->>Verifier: 4. Grade submission out of band
+    Verifier-->>Runner: passed / failed / format_failed / ...
+    Runner->>Backend: 5. Drop database, kill backend process
+```
+
 **The submission tool is a format gate, not a grader.** The agent turns in its answer by calling the benchmark MCP's `submit_result` tool, which checks only that the payload matches the task's JSON schema — a malformed submission gets a structured error back so the model can self-correct within its own tool loop, bounded by a small attempt budget. Real correctness is checked separately, by a `pytest` verifier that **never enters the sandbox or the MCP surface the agent operates in** — so the agent has no path to read its own grading logic or otherwise game it. The verifier reads fixed environment variables the harness sets: `BENCH_RESULT` (the submitted JSON, always set), `BENCH_FIXTURES` (a directory of task `inputs/`/`expected/`, when either exists), `BENCH_OUTPUT` (a file the agent exported via `download_file`, for artifact-producing tasks), and `BENCH_STATE` (a JSON snapshot of backend REST state plus the run's ordered tool calls, for tasks whose effect is *backend state* rather than a returned value — e.g. "did the agent create a skill," "how many tools/skills have a name matching X").
 
 A task directory (`tasks/<id>/`) separates `inputs/` (staged into the agent's sandbox and readable by the verifier) from `expected/` (verifier-only ground truth that is never staged to the agent — a file's `src` is confined to `inputs/` at load time specifically so a precomputed answer can't leak in). Verifiers run in their own ephemeral `uv` environment per task, with a shared stdlib helper (`bench_verifier.py`) exposing `result()`, `state()`, `output()`, `fixtures(*rel)`, and `read_fixture_json(*rel)` so individual verifiers read the contract through a stable API instead of re-deriving the env-var plumbing themselves.
@@ -30,6 +46,18 @@ A task directory (`tasks/<id>/`) separates `inputs/` (staged into the agent's sa
 ## Outcomes
 
 Each `(environment, task, provider, model)` cell resolves to exactly one of: `passed`/`failed` (a well-formed result was submitted and the verifier accepted/rejected it), `format_failed` (the agent never matched the schema within its attempt budget), `no_submission` (the run finished without calling `submit_result` at all), or `agent_error` (the chat run itself errored before grading — an `infra:`-prefixed variant marks a backend/boot failure for that lane specifically, so sibling lanes aren't treated as failed by association).
+
+```mermaid
+flowchart TD
+    A["Chat run completes"] --> B{"Did the run error<br/>before grading?"}
+    B -->|Yes| C["agent_error<br/>('infra:' prefix if backend/boot failure)"]
+    B -->|No| D{"Was submit_result<br/>ever called?"}
+    D -->|No| E["no_submission"]
+    D -->|"Yes, but never matched schema<br/>within attempt budget"| F["format_failed"]
+    D -->|"Yes, well-formed submission"| G{"Verifier accepts?"}
+    G -->|Yes| H["passed"]
+    G -->|No| I["failed"]
+```
 
 ## The harness: a Rust binary with five subcommands
 

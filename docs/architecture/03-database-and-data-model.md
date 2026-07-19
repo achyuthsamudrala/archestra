@@ -59,6 +59,20 @@ This means a schema change (adding a column, changing a type) automatically ripp
 - **Data migrations mixed with schema migrations**: when a migration needs both DDL and a data backfill, the convention (`.claude/skills/archestra-dev-migrations/SKILL.md`) is schema DDL first, then `--> statement-breakpoint`, then the data statements — `pnpm db:generate` only ever emits the DDL half; the data-migration tail is hand-appended and preserved manually across any regeneration (this matters specifically when resolving merge conflicts on colliding migration numbers, per `resolve-conflicts.md` in the same skill).
 - **Generated API client dependency**: because the frontend's typed API client (`platform/shared/hey-api/clients/`, generated via `@hey-api/openapi-ts` from `docs/openapi.json` — see [Backend Architecture](./02-backend.md#openapi--generated-api-client)) is derived from the same Zod schemas that `drizzle-zod` derives from the DB schema, a schema change that alters a route's request/response shape typically requires regenerating both the OpenAPI spec and the API client, not just running a migration.
 
+The generate-then-check workflow, end to end:
+
+```mermaid
+flowchart TB
+    A["Edit table definition in<br/>database/schemas/*.ts"] --> B["pnpm db:generate<br/>diffs schema vs. last snapshot"]
+    B --> C["New numbered SQL migration +<br/>journal entry (meta/_journal.json)"]
+    C --> D["Commit schema + migration files"]
+    D --> E{"CI: drizzle-kit check +<br/>pnpm check:migrations"}
+    E -- "drift, lint failure,<br/>or missing migration" --> F["Build fails"]
+    E -- "consistent" --> G["Merge"]
+    G --> H["pnpm db:migrate<br/>applies pending migrations"]
+    A -.->|"if request/response shape changes"| I["Regenerate OpenAPI spec +<br/>typed API client"]
+```
+
 ## Core Entities & Relationships
 
 ### The unified `agents` table
@@ -76,12 +90,12 @@ Selected columns on `agentsTable` reveal a lot of the platform's actual behavior
 
 ### `agents` → `conversations` → `messages`
 
-```
-agents (1) ──< conversations (1) ──< messages
-   │  agentId FK, ON DELETE SET NULL     │  conversationId FK, ON DELETE CASCADE
-   │  (conversation survives agent          │
-   │   deletion; agentId becomes null)      │
-   └── modelId FK → models                  └── content: jsonb (full AI-SDK UIMessage)
+```mermaid
+erDiagram
+    agents ||--o{ conversations : "agentId FK, ON DELETE SET NULL"
+    models ||--o{ conversations : "modelId FK"
+    projects ||--o{ conversations : "projectId FK, ON DELETE SET NULL"
+    conversations ||--o{ messages : "conversationId FK, ON DELETE CASCADE"
 ```
 
 - `conversationsTable` (`database/schemas/conversation.ts`) has a nullable `agentId` FK with `onDelete: "set null"` — deleting an agent does not cascade-delete its chat history; conversations become orphaned-but-preserved. It also carries `modelId` (FK to `models`, superseding deprecated `selectedModel`/`selectedProvider` text columns kept only for backward read compatibility), an optional `projectId` (`onDelete: "set null"` — a chat "lives" in a project only loosely), an `origin` enum (`user`, `schedule_trigger`, `app_open`), and `todoList` as a typed `jsonb` array.
@@ -128,15 +142,24 @@ The `unique(organizationId, role)` constraint is what guarantees "one role ident
 
 ## Relationship Diagram (Selected Entities)
 
-```
-organizations ──< team ──< agent_team >── agents ──< conversations ──< messages
-      │              │                       │  (agentId, ON DELETE SET NULL)
-      │              ├──< virtual_api_key_team >── virtual_api_keys
-      │              └──< mcp_catalog_team >── internal_mcp_catalog ──< mcp_server (teamId FK, single-team)
-      │
-      └──< organization_role   (custom RBAC roles, unique per organizationId+role)
+```mermaid
+erDiagram
+    organizations ||--o{ team : "org has teams"
+    organizations ||--o{ organization_role : "custom RBAC roles, unique per org+role"
 
-kb_documents ──< kb_chunks (pgvector embeddings @ 5 dimensions, tsvector, row-level acl jsonb)
+    team ||--o{ agent_team : "team-scoping junction"
+    agents ||--o{ agent_team : "agent-scoping junction"
+    agents ||--o{ conversations : "agentId FK, ON DELETE SET NULL"
+    conversations ||--o{ messages : "conversationId FK, ON DELETE CASCADE"
+
+    team ||--o{ virtual_api_key_team : "team-scoping junction"
+    virtual_api_keys ||--o{ virtual_api_key_team : "key-scoping junction"
+
+    team ||--o{ mcp_catalog_team : "team-scoping junction"
+    internal_mcp_catalog ||--o{ mcp_catalog_team : "catalog-scoping junction"
+    internal_mcp_catalog ||--o{ mcp_server : "installed as (teamId direct FK, single-team)"
+
+    kb_documents ||--o{ kb_chunks : "documentId FK, ON DELETE CASCADE, pgvector embeddings @ 5 dimensions"
 ```
 
 ## Design Decisions & Tradeoffs

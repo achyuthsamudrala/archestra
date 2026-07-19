@@ -34,7 +34,53 @@ The tradeoff is explicit in the CLI warning text baked into the entrypoint: moun
 - `horizontal-pod-autoscaler.yaml`, `pod-disruption-budget.yaml`, `gke-backend-config.yaml` — standard production scaling/availability primitives, all opt-in (`enabled: false` by default) except the sizing already reflects real operational lessons: the default Postgres memory limit (2Gi, above the 1Gi request) exists because "a hard 1Gi ceiling has OOM-killed the bundled instance under load" (`values.yaml` comment), and `max_connections = 250` is sized explicitly against worst-case pod count (web + worker + rollout surge + migration job + metrics exporter).
 - A vendored `dagger-helm` subchart (`charts/dagger-helm-0.21.5.tgz`, aliased `dagger`) and `postgresql` subchart (Bitnami, `charts/postgresql-18.0.8.tgz`) — Postgres is optional (`postgresql.enabled: false` plus `external_database_url` to point at RDS/Cloud SQL instead; the image already vendors both providers' CA bundles into `NODE_EXTRA_CA_CERTS` for `sslmode=require`).
 
+The `migration-job` hook runs as a separate Job rather than inline in the web Deployment's startup, so the previous release's pods keep serving traffic while the schema migrates, and its `lock_timeout` makes a blocked migration fail fast instead of stalling live queries:
+
+```mermaid
+sequenceDiagram
+    participant Helm
+    participant Old as Previous release pods
+    participant Job as migration-job (pre-upgrade hook)
+    participant PG as PostgreSQL
+    participant New as New release pods
+
+    Helm->>Job: run pre-upgrade hook
+    Note over Old: keep serving traffic
+    Job->>PG: pnpm db:migrate<br/>(PGOPTIONS lock_timeout=5s)
+    alt lock acquired within lock_timeout
+        PG-->>Job: migration succeeds
+        Job-->>Helm: hook succeeds
+        Helm->>New: roll out new pods
+    else ACCESS EXCLUSIVE lock blocked past lock_timeout
+        PG-->>Job: fails fast (lock_timeout exceeded)
+        Job-->>Helm: hook fails
+        Helm-->>Helm: abort upgrade
+    end
+```
+
 The chart's `orchestrator.kubernetes` values section (`values.yaml`) controls how the platform *itself* talks to the cluster it's deployed on to manage MCP server pods: in-cluster config via its own ServiceAccount (`loadKubeconfigFromCurrentCluster: true`, the default and typical production setting) or a mounted kubeconfig Secret for out-of-cluster orchestration. This maps directly to the backend env vars `ARCHESTRA_ORCHESTRATOR_KUBECONFIG` / `ARCHESTRA_ORCHESTRATOR_LOAD_KUBECONFIG_FROM_CURRENT_CLUSTER` / `ARCHESTRA_ORCHESTRATOR_K8S_NAMESPACE` (`platform/backend/src/config.ts`), which together gate the `orchestratorK8sRuntime` feature flag returned by `/api/features` — the frontend disables local-MCP-server functionality entirely when neither is configured.
+
+The two topologies described above differ mainly in where the Kubernetes cluster comes from:
+
+```mermaid
+flowchart TB
+    subgraph Quickstart["1. Quickstart — single container"]
+        direction TB
+        Q_run["docker run<br/>ARCHESTRA_QUICKSTART=true<br/>+ mounted Docker socket"] --> Q_entry["docker-entrypoint.sh"]
+        Q_entry --> Q_kind["Embedded KinD cluster ('archestra-mcp')<br/>inside container's own Docker daemon access"]
+        Q_entry --> Q_pg["PostgreSQL<br/>(in-container, via supervisord)"]
+        Q_kind --> Q_mcp["MCP orchestrator<br/>(pod-per-MCP-server)"]
+    end
+
+    subgraph Helm["2. Helm chart — external cluster (production)"]
+        direction TB
+        H_chart["platform/helm/archestra"] --> H_web["archestra-platform<br/>web Deployment<br/>(API :9000, metrics :9050, frontend :3000)"]
+        H_chart --> H_worker["archestra-worker<br/>(optional Deployment)"]
+        H_chart --> H_migration["migration-job<br/>(pre-upgrade hook)"]
+        H_chart --> H_pg["postgresql subchart<br/>or external_database_url"]
+        H_web --> H_mcp["MCP orchestrator<br/>(pod-per-MCP-server)<br/>on external Kubernetes cluster"]
+    end
+```
 
 ### 3. Local development: Tilt + K8s + host processes (hybrid)
 
@@ -49,6 +95,20 @@ Local dev doesn't run the production Docker image at all — `tilt up` orchestra
 3. **`deps` / `builder-base` / `builder`** — standard pnpm monorepo build: install with `--frozen-lockfile`, compile the Rust NAPI addons (`archestra-rs/*`), run `pnpm build` (frontend + backend), then `pnpm deploy --filter=@backend --prod --legacy` to assemble a self-contained backend tree (this replaced an earlier hand-rolled copy of each NAPI crate's `.node`/`index.cjs`, which had dropped a dependency and crashed the image with `MODULE_NOT_FOUND`).
 4. **`unified-slim`** — the runtime image: Node 24 Alpine base, PostgreSQL 17 + pgvector installed via `apk`, `supervisord` for process management, the from-source KinD/Docker-CLI/`kubectl`/Dagger CLI binaries copied in, the built backend (`pnpm deploy` output) and frontend (`next build`'s standalone server) copied in. `unified-slim` deliberately excludes the ~352MB Dagger Engine tarball so CI's e2e shards (which build `--target unified-slim`) never pay that cost.
 5. **`unified`** — `unified-slim` plus the pre-baked Dagger Engine tarball layered on top. This is the default build target (no `--target` flag) and what `docker pull archestra/platform:latest` resolves to — it must remain the last stage in the file so ordinary builds (releases, quickstart CI, fork PRs, local `docker build`) get the full, offline-capable image.
+
+```mermaid
+flowchart LR
+    A["go-builder<br/>(KinD, Docker CLI, Dagger CLI, kubectl —<br/>built from source)"]
+    B["dagger-manifest /<br/>dagger-engine-image<br/>(pre-pulled Dagger Engine tarball)"]
+    C["deps → builder-base → builder<br/>(pnpm install, Rust NAPI build,<br/>pnpm build, pnpm deploy)"]
+    D["unified-slim<br/>(runtime image, excludes Dagger tarball)"]
+    E["unified<br/>(default build target =<br/>archestra/platform:latest)"]
+
+    A --> D
+    C --> D
+    B --> E
+    D --> E
+```
 
 Frontend static assets get special handling: `COPY prev-static-assets/ ./frontend/.next/static/` copies in the *previous* release's Next.js static assets (content-hashed filenames avoid collisions) before overlaying the current build's assets on top, and a clean copy of only the current build's assets is written to `/static-assets-source/` for CI to extract as input to the *next* release's `prev-static-assets/`. This exists so that clients with an old build cached in the browser (e.g. a long-lived tab open across a deploy) can still fetch their old chunk after the server rolls to a new version, instead of hitting a 404 on a static asset that no longer exists in the new image.
 

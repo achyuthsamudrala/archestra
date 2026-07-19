@@ -168,6 +168,27 @@ export default async function LlmProxyLogsPageServer() {
 
 This avoids a client-side loading spinner on first paint for data-heavy pages (logs, tables) while keeping all subsequent fetches, pagination, and cache invalidation on the normal client-side TanStack Query path — no server-side query cache serialization/dehydration machinery is needed. The client-side `DataTable` (`src/components/ui/data-table.tsx`, built on `@tanstack/react-table`) is driven with `manualPagination`/`manualSorting` props wired to `useDataTableQueryParams()`, so paging/sorting state round-trips through URL query params and refetches from the backend rather than paginating an in-memory array — the mechanism referred to elsewhere as "server-side paginated tables."
 
+The data-fetching pattern end to end, spanning the generated client, the `.query.ts` convention, and the `initialData` hybrid:
+
+```mermaid
+flowchart TB
+    subgraph Server["Server render (page.tsx)"]
+        SC["Server Component<br/>getServerApiHeaders() + archestraApiSdk.*() call"]
+    end
+    subgraph Client["Client render (page.client.tsx)"]
+        CC["'use client' component<br/>useQuery({ initialData })"]
+        QH[".query.ts hook<br/>(only caller of archestraApiSdk)"]
+    end
+    Rewrite["Next.js rewrites()<br/>('/api/*', '/v1/*', ...)"]
+    Backend["Fastify backend<br/>(port 9000)"]
+
+    SC -->|"initialData prop"| CC
+    CC --> QH
+    SC -->|"archestraApiSdk.*() call"| Rewrite
+    QH -->|"archestraApiSdk.*() call"| Rewrite
+    Rewrite --> Backend
+```
+
 ## Chat and streaming UI
 
 Chat state is centralized in a single React context, `src/lib/chat/global-chat.context.tsx` (`ChatProvider`, mounted once in the root layout), built on **`useChat` from `@ai-sdk/react`** (Vercel AI SDK) rather than a hand-rolled SSE reader:
@@ -194,6 +215,33 @@ const { messages, sendMessage, regenerate, resumeStream, status, setMessages, st
 
 Per the model documented in CLAUDE.md, tool execution is **not** performed server-side by the LLM proxy — the proxy returns `tool_use`/`tool_calls` to the client, which is expected to run the standard agentic loop: call the proxy, receive tool calls, execute them via the MCP Gateway (`POST /v1/mcp/${profileId}` with `Authorization: Bearer ${archestraToken}`), send results back, repeat until a final answer. `src/lib/chat/api-call.ts` and the various `use-chat-apps.ts`/`apps-context.tsx` files in `components/chat/` are where this loop's tool-call rendering and MCP app (interactive UI) integration live on the frontend side. `onFinish`'s handling of `isAbort` (stripping dangling tool-call parts left behind when a user stops mid-tool-call) and of `isError` (deliberately *not* clearing the in-flight recovery flag, because the SDK fires `onFinish` from a `finally` block right after `onError`) show the amount of care taken to keep client-rendered message state consistent with what the backend persists.
 
+The streaming request/response cycle, including the tool-call round trip and the resumable-stream reconnect path:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant useChat as "useChat / DefaultChatTransport"
+    participant Rewrite as "Next.js rewrite proxy"
+    participant Backend as "Fastify backend ('/api/chat')"
+    participant MCP as "MCP Gateway ('/v1/mcp/:profileId')"
+
+    User->>useChat: sendMessage()
+    useChat->>Rewrite: POST /api/chat
+    Rewrite->>Backend: proxied POST /api/chat
+    Backend-->>useChat: SSE stream (text / tool_use)
+    alt tool call returned
+        useChat->>MCP: POST /v1/mcp/:profileId<br/>(Authorization: Bearer archestraToken)
+        MCP-->>useChat: tool result
+        useChat->>Rewrite: POST /api/chat (tool result)
+        Rewrite->>Backend: proxied
+        Backend-->>useChat: SSE stream (final answer)
+    end
+    Note over useChat: connection dropped or page reloaded mid-turn
+    useChat->>Rewrite: prepareReconnectToStreamRequest()<br/>GET /api/chat/conversations/:id/active-run
+    Rewrite->>Backend: proxied
+    Backend-->>useChat: resumed SSE stream (resumeStream())
+```
+
 Conversation-list management (rename, delete, select) lives in the main sidebar via `src/app/_parts/chat-sidebar-section.tsx`, separate from the message-stream context.
 
 ## Theming and white-labeling
@@ -206,6 +254,16 @@ Themes are data-driven from a single external source, not hand-authored CSS-in-J
 4. Applying a theme is a plain DOM class swap, not a React re-render of styled values: `src/lib/theme.hook.ts`'s `applyThemeOnUI()` strips any `theme-*` class off `document.documentElement` and adds `theme-${themeId}`, matching the CSS classes `generate-theme-css.ts` emitted.
 
 **White-labeling settings** (organization theme, logo/logo-dark, icon logo, favicon, app name, OG description, footer text, chat links, onboarding wizard, chat placeholders, chat error support message) live on the backend as "organization appearance settings" and are exposed through a **public, unauthenticated** endpoint — `useAppearanceSettings()` (`src/lib/organization.query.ts`) — deliberately, so the sign-in page and other pre-auth surfaces can render the correct branding before a session exists. `src/lib/theme.hook.ts`'s `useOrgTheme()` layers this with `localStorage` (`archestra-theme` key) to avoid a flash of the wrong theme on load: it seeds React state from `localStorage`, then reconciles with the backend value once it arrives, and (only for non-auth pages) exposes `setPreviewTheme`/`saveAppearance` for live-preview-then-save editing.
+
+```mermaid
+flowchart LR
+    LS["localStorage<br/>('archestra-theme' key)"] -->|"seed initial state"| Hook["useOrgTheme()"]
+    Public["Public appearance endpoint<br/>(unauthenticated)"] -->|"useAppearanceSettings()"| Hook
+    Hook -->|"reconcile once backend value arrives"| DOM["applyThemeOnUI()<br/>swaps 'theme-*' class on document root"]
+    Hook -->|"setPreviewTheme / saveAppearance<br/>(non-auth pages)"| Settings["/settings/organization<br/>editing UI"]
+    Public -.-> Head["DynamicHead<br/>(title, favicon, OG meta)"]
+    Public -.-> Loader["OrgThemeLoader<br/>(mounted root-layout-wide)"]
+```
 
 The editing UI is **`src/app/settings/organization/page.tsx`**, gated behind `organizationSettings: ["update"]` permission checks (`WithPermissions`, admin-only in practice), composing `ThemeSelector` (grid of theme swatches with live preview via `setPreviewTheme`), `LogosSection`, `FaviconUpload`, and a "Branding" card for app name/OG description/footer/chat links/placeholders/onboarding wizard — as noted above, this is the actual home of what CLAUDE.md calls "Appearance Settings," despite living at `/settings/organization` rather than `/settings/appearance`.
 

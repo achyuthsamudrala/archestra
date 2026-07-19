@@ -40,6 +40,21 @@ A Skill is a named, versioned SKILL.md instruction set plus optional bundled res
 
 **Version pinning at mount time.** `skills/skill-version-resolution.ts:resolveActivationVersion` is the function that decides which version a `load_skill` call actually exposes: if the skill is already mounted in the conversation's default sandbox, it returns *that* mounted version (not necessarily the latest — a mid-conversation edit to the skill does not retroactively change what a running sandbox sees); otherwise it mounts the skill's current `latestVersion` and pins it. A same-named-skill mount collision (two different skills both trying to claim `/skills/<name>`) is handled explicitly: the loser resolves with `mounted: false` and is shown to the model read-only, never advertised as runnable, so the model is never told to execute code that actually belongs to a different skill.
 
+The versioning relationships that make "pin the mounted version, don't retroactively change it" possible:
+
+```mermaid
+erDiagram
+    SKILL ||--o{ SKILL_VERSION : "has versions"
+    SKILL {
+        int latestVersion "head pointer"
+    }
+    SKILL_VERSION ||--o{ SKILL_VERSION_FILE : "bundles files"
+    SKILL_VERSION {
+        int version "immutable once created;<br/>edit forks a new row"
+    }
+    SKILL_SANDBOX_SKILL_MOUNT }o--|| SKILL_VERSION : "pins skill_version_id<br/>(not a name)"
+```
+
 ## The sandbox execution model
 
 **Code:** `skills-sandbox/` (see its own `README.md` — this section summarizes and extends it) and `archestra-mcp-server/sandbox.ts` (the MCP tool layer: `run_command`, `upload_file`, `download_file`, plus the persistent-file tools `search_files`/`read_file`/`save_file`/`edit_file`/`delete_file`).
@@ -54,6 +69,16 @@ The core design decision is that **Postgres, not Dagger, is the source of truth.
 2. Replays the entire ordered event log — each command re-executes, each upload re-writes its bytes at its absolute path, each skill mount re-writes the pinned version's files under `/skills/<name>`.
 3. Executes the new command.
 4. Appends the new command to the log.
+
+```mermaid
+flowchart TB
+    A[("Postgres: skill_sandbox_replay_events<br/>(ordered log, source of truth)")] --> B["run_command called"]
+    B --> C["1. Materialize a fresh Dagger<br/>container from the base image"]
+    C --> D["2. Replay entire ordered event log<br/>(commands, uploads, skill mounts)"]
+    D --> E["3. Execute the new command"]
+    E --> F["4. Append the new command to the log"]
+    F --> A
+```
 
 `skills-sandbox/README.md` is explicit that interleaving is preserved exactly: a file uploaded between command A and command B is *not* present while A replays, because the on-disk order always matches acceptance order. Dagger's content-addressed layer cache is what keeps this fast in the common case (unchanged prefix ⇒ cache hit ⇒ near-zero wall-clock cost for replay); a cold cache or engine restart just means a slower — but still deterministic, for deterministic commands — rebuild from the DB recipe. Non-deterministic commands (network calls, `time`/RNG) are an accepted v1 limitation: the recorded stdout from the original run stays the canonical observation even if a literal replay would diverge.
 
@@ -83,6 +108,24 @@ There are three distinct file surfaces in play, and the tool descriptions in `sa
 3. **Persistent files** (`skill_sandbox_files`, kind `artifact`) — the conversation's Files panel, what the *user* actually sees. `download_file` copies bytes from the sandbox's ephemeral filesystem into this durable store; the model only ever receives a short metadata reference back (`fileId`, `path`, `mimeType`, `sizeBytes`) — the actual bytes are never returned into the model's context, and are fetched by the frontend directly via `/api/skill-sandbox/artifacts/:id`. This is a deliberate one-way valve: `save_file`/`download_file`'s tool descriptions explicitly instruct the model to *export by path* rather than "read a file's bytes back and paste them into your reply" — keeping large or binary content out of the token stream entirely.
 
 `upload_file`'s four source shapes (`chat_attachment`, `base64`, `text`, `my_file` — a persistent file pulled back into the sandbox) all funnel through the same replay-log write path, so regardless of origin, an upload is durable and replayable the same way. A `chat_attachment` source is read server-side and never passes through model context (`skills-sandbox/README.md`), and is rejected if the attachment doesn't belong to both the caller's organization *and* the current conversation — closing a cross-conversation exfiltration path where a model could try to reference another conversation's attachment id.
+
+```mermaid
+flowchart LR
+    subgraph Sources["upload_file source shapes"]
+        CA["chat_attachment"]
+        B64["base64 / text"]
+        MF["my_file<br/>(persistent file pulled back in)"]
+    end
+
+    CA -->|"auto-staged by<br/>stageConversationAttachments<br/>(default sandbox only)"| SB
+    CA -->|"or explicit upload_file<br/>(non-default sandboxes)"| UF
+    B64 --> UF["upload_file"]
+    MF --> UF
+    UF --> SB["1. Sandbox filesystem<br/>(ephemeral, replay-log write)"]
+    SB -->|download_file| PF["3. Persistent file<br/>(skill_sandbox_files, kind=artifact)"]
+    PF -->|"metadata reference only<br/>(fileId, path, mimeType, sizeBytes)"| Model["Model context"]
+    PF -->|"bytes fetched via<br/>/api/skill-sandbox/artifacts/:id"| FE["Frontend"]
+```
 
 ## Fail-closed re-checks
 

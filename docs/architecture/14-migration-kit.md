@@ -21,6 +21,17 @@ discover.py → inventory.json → [you map + ask the user] → migration_plan.j
   deterministic                       judgment                                     deterministic
 ```
 
+The five steps below walk through that pipeline, plus the connect step that precedes it:
+
+```mermaid
+flowchart TB
+    S1["Step 1: Connect<br/>connect to or start an Archestra instance,<br/>wait_ready(), mint API key"] --> S2
+    S2["Step 2: Discover (discover.py)<br/>deterministic — scan source,<br/>emit secret-redacted inventory.json"] --> S3
+    S3["Step 3: Map + ask<br/>judgment — author migration_plan.json,<br/>AskUserQuestion for genuine ambiguities"] --> S4
+    S4["Step 4: Apply (apply.py)<br/>deterministic — dry-run, then real apply"] --> S5
+    S5["Step 5: Report<br/>write report.md from migration_result.json"]
+```
+
 **Step 1 — Connect.** The agent (running the skill) either connects to an existing Archestra instance or starts a local Docker one, per `references/install.md`, calls `wait_ready()` as the real readiness gate, and mints an API key.
 
 **Step 2 — Discover (`discover.py`, deterministic).** Scans the source directory and emits a **secret-redacted** `inventory.json` — it never writes credentials to the file. Its frontmatter parser only handles `key: value` scalars, inline `[a, b]` lists, and `- item` block lists; anything it can't confidently interpret (block scalars, nested maps, anchors, comments) is reported into an `unknowns` bucket rather than guessed at, so a human reviews those rather than trusting a silently-wrong parse.
@@ -46,6 +57,19 @@ The skill then shows the user a **preview** (ready-to-create table, needs-your-d
 | LLM provider keys | LLM provider API keys | Only migrated if the user pastes the replacement secret directly; never read out of source files. |
 | A simple declarative guard hook | Tool invocation policy (optional) | Only when the guard's target tool exists in Archestra; extracted as `{tool_name, key, operator, value, action?, reason?}`. |
 | Hooks for other events, openclaw config, unrecognized files | Reported for manual follow-up | No attempt to force-fit these into an Archestra concept. |
+
+The same mapping, as a diagram:
+
+```mermaid
+flowchart LR
+    A["Project-level instructions"] --> B["Primary agent"]
+    C["Skills, subagents, slash<br/>commands, local tools"] --> D["Skills"]
+    E["MCP server configs"] --> F["Private MCP catalog items<br/>(install is opt-in)"]
+    G["SessionStart / PreToolUse /<br/>PostToolUse hooks"] --> H["Native Archestra<br/>lifecycle hooks"]
+    I["LLM provider keys"] --> J["LLM provider API keys<br/>(only if user pastes secret)"]
+    K["Simple declarative guard hook"] --> L["Tool invocation policy<br/>(optional)"]
+    M["Other-event hooks, openclaw<br/>config, unrecognized files"] --> N["Manual follow-up"]
+```
 
 ### MCP install is opt-in, not automatic
 

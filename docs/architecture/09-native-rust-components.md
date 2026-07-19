@@ -57,6 +57,25 @@ Per the `archestra-dev-rust-napi` skill's NAPI rule — *"the host process must 
 
 Rust errors don't cross the FFI boundary as native `napi::Error` variants with structure — they're serialized to a JSON string (`{code, message}`) inside the `Error.message`, because that's the only channel napi's `GenericFailure` status reliably carries. Both `app_runtime_core`/`image_core`'s panic converters and `sandbox_core::SandboxError::code()` (an enum → `&'static str` mapping: `ARCHESTRA_ENGINE_UNREACHABLE`, `ARCHESTRA_COMMAND_FAILED`, `ARCHESTRA_ARTIFACT_TOO_LARGE`, `ARCHESTRA_ARTIFACT_NOT_FOUND`, `ARCHESTRA_SANDBOX_HISTORY_LIMIT`, `ARCHESTRA_INVALID_INPUT`, `ARCHESTRA_INTERNAL`) follow this convention. On the JS side, `napi-loader/index.cjs`'s `normalizeNativeError` parses that JSON back out and re-throws a real `Error` with `.code` and `.cause` set, so TypeScript callers (e.g. `sandbox-runtime-service.ts`'s `NativeSandboxErrorCode` union) get typed, catchable error codes instead of opaque native-panic strings.
 
+The panic-containment and error-propagation path, end to end:
+
+```mermaid
+sequenceDiagram
+    participant TS as "TypeScript caller<br/>(e.g. sandbox-runtime-service.ts)"
+    participant Wrap as "wrapSync/wrapAsync<br/>(napi-loader)"
+    participant NAPI as "NAPI entry point<br/>('*-rs' adapter)"
+    participant Core as "'*-core' Rust logic"
+
+    TS->>Wrap: call exported function
+    Wrap->>NAPI: invoke
+    NAPI->>Core: catch_unwind(core call)
+    Core--xNAPI: panic (e.g. a dependency's .unwrap())
+    NAPI->>NAPI: convert panic to napi::Error<br/>(JSON body with code + message)
+    NAPI-->>Wrap: GenericFailure (JSON string)
+    Wrap->>Wrap: normalizeNativeError()<br/>parses JSON back out
+    Wrap-->>TS: throw Error with .code / .cause set
+```
+
 ## `napi-loader`: solving cross-platform native binary resolution
 
 `platform/archestra-rs/napi-loader/` (`@archestra/napi-loader`) is shared, hand-maintained CommonJS scaffolding (not itself a Rust crate) consumed by all three `*-rs` crates' generated `index.cjs`. It solves two problems napi-rs's default per-platform-package pattern would otherwise duplicate three times:
@@ -65,6 +84,25 @@ Rust errors don't cross the FFI boundary as native `napi::Error` variants with s
 2. **Uniform panic-to-Error normalization.** `wrapSync`/`wrapAsync` wrap every exported native function so a caught Rust panic (see above) becomes a clean `Error` with `.code`/`.cause` before the caller ever sees it — the crate-specific `index.cjs` files are two-line wrappers around this.
 
 Each crate's own `index.d.ts` is the actual typed public API (napi-rs auto-generated); `napi-loader`'s own `.d.ts` is intentionally loosely typed (`Record<string, unknown>`), since it's infrastructure, not the product surface.
+
+The overall in-process bridge, spanning the three core/adapter crate pairs and the shared loader:
+
+```mermaid
+flowchart TB
+    subgraph Node["Node / V8 process (backend)"]
+        TS["TypeScript backend code<br/>(lazy import('@archestra/*-rs'))"]
+        Loader["napi-loader<br/>loadNativeBinding()<br/>platform-triple resolution"]
+        subgraph Addons["Loaded .node addons"]
+            AR[".node: app-runtime-rs<br/>(thin adapter over app-runtime-core)"]
+            IMG[".node: image-rs<br/>(thin adapter over image-core)"]
+            SBX[".node: sandbox-rs<br/>(thin adapter over sandbox-core)"]
+        end
+    end
+    TS --> Loader
+    Loader -->|"resolves e.g.<br/>'sandbox_rs.linux-x64-musl.node'"| SBX
+    Loader --> AR
+    Loader --> IMG
+```
 
 ## Per-crate walkthrough
 
@@ -79,6 +117,26 @@ This is the largest and most architecturally significant crate pair (`sandbox-co
 - `session.rs` — a backend-agnostic actor: one session per `RuntimeTarget` (default engine, or a per-environment Dagger engine pod), request queueing via `tokio::sync::mpsc`, a `Semaphore`-based concurrency cap (`MAX_CONCURRENT_HANDLERS = 32`, defense-in-depth behind the TS-side queue cap), and a retry policy that distinguishes *safe-to-retry* engine faults (`EngineFault::StaleAttachables` — the engine gave up before the query ran, so nothing executed) from generic failures that must not be retried blindly (a `run` or `read_artifact` might have partially executed).
 - `validation.rs`, `supervisor.rs`, `telemetry.rs`, `tracing_ctx.rs` — path/cwd/encoding validation, the in-container command supervisor protocol (caps stdout/stderr, reports timeout/exit-code/truncation as one JSON document so only bounded JSON crosses the GraphQL boundary), and the crate's own OTLP telemetry pipeline (below).
 
+The `dagger.rs` materialize/replay flow — a request is never run against a live standing container, it's rebuilt from an ordered log each time, with unchanged steps served from Dagger's content-addressed layer cache:
+
+```mermaid
+flowchart TB
+    Log["Ordered replay log<br/>(commands, file uploads,<br/>skill mounts under /skills)"]
+    CLI["Spawned 'dagger session' CLI<br/>(Dagger engine)"]
+    Base["Warm base image<br/>(shared once per session)"]
+    Materialize["materialize()<br/>replays log entry by entry"]
+    Cache{"Prefix unchanged<br/>vs. cache?"}
+    CacheHit["Reuse cached layer<br/>(near-zero cost)"]
+    Exec["Execute step<br/>(new content-addressed layer)"]
+    Result["CommandExecution result<br/>{stdout, stderr, exitCode, ...}"]
+
+    CLI --> Base --> Materialize
+    Log --> Materialize
+    Materialize --> Cache
+    Cache -->|yes| CacheHit --> Result
+    Cache -->|no| Exec --> Result
+```
+
 **Exposed NAPI surface** (`platform/archestra-rs/sandbox-rs/src/lib.rs`, all async, all call `core::telemetry::init()` first since it's idempotent):
 - `checkSession(input?) -> Promise<void>` — verify the engine is reachable and the warm base image builds.
 - `runSandbox(input) -> Promise<CommandExecution>` — replay history, run one command, return `{stdout, stderr, exitCode, durationMs, timedOut, truncated}`.
@@ -89,6 +147,23 @@ This is the largest and most architecturally significant crate pair (`sandbox-co
 **Consumed from TypeScript** at `backend/src/sandbox-runtime/sandbox-runtime-service.ts` and `backend/src/skills-sandbox/skill-sandbox-runtime-service.ts`, which lazy-`import("@archestra/sandbox-rs")` (so codegen/OpenAPI generation and any request path that never touches the sandbox never needs the compiled `.node` present) and map the `{code, message}` error payload to a typed `SandboxRuntimeError`.
 
 **Rust-owned OTLP telemetry.** Unlike a typical library, `sandbox-core` owns its *own* process-global tracing/telemetry pipeline (`sandbox-core/src/telemetry.rs`) rather than borrowing the Node SDK's — because there is no way for a Rust `tracing` subscriber to plug into a Node OpenTelemetry SDK in-process. It ships traces and logs to the same OTLP collector the Node side targets (default `http://localhost:4318`, configurable via `ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT` and bearer/basic auth env vars mirroring the Node exporter config), tagged `service.name=archestra-sandbox-rs`. The two sides are stitched into one trace via the W3C `traceparent` header, which the TS caller forwards explicitly on every `RunSandboxInput`/`ReadArtifactInput`/`CheckSessionInput` and which `tracing_ctx.rs` attaches as the remote parent of the Rust span (`attach_parent`) — see `07-agents-skills-sandbox.md` and [Observability](./10-observability.md) for the Node-side half of this. This is gated behind the `telemetry` Cargo feature (on for the `sandbox-rs` binding, off for plain `cargo test` "so `cargo test` of the pure logic stays light").
+
+```mermaid
+flowchart LR
+    subgraph NodeSide["Node process"]
+        NodeOTel["Node OTel SDK"]
+        TSCaller["TS caller<br/>(sandbox-runtime-service.ts)"]
+    end
+    subgraph RustSide["sandbox-rs / sandbox-core"]
+        RustOTel["sandbox-core::telemetry<br/>(service.name=archestra-sandbox-rs)"]
+    end
+    Collector["OTLP collector<br/>(default localhost:4318)"]
+
+    NodeOTel -->|"OTLP HTTP"| Collector
+    RustOTel -->|"OTLP HTTP"| Collector
+    NodeOTel -.->|"originates trace"| TSCaller
+    TSCaller -->|"traceparent header<br/>(RunSandboxInput / ReadArtifactInput / CheckSessionInput)"| RustOTel
+```
 
 ### `app-runtime-core` / `app-runtime-rs` — owned-app HTML envelope and validation
 
