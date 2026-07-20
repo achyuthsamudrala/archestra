@@ -29,6 +29,7 @@ rather than silently repeated — see [§10 of the tradeoffs doc](./15-design-de
 | 13 | [ai-labs / archestra-bench](./13-ai-labs-benchmark.md) | Internal agentic evaluation harness (separate Rust workspace) |
 | 14 | [Migration Kit](./14-migration-kit.md) | Migrating Claude Code / OpenClaw / Hermes setups into Archestra |
 | 15 | [Design Decisions & Tradeoffs](./15-design-decisions-and-tradeoffs.md) | Cross-cutting decisions that recur across every subsystem above |
+| 16 | [User Onboarding & Interfaces](./16-user-onboarding-and-interfaces.md) | The human-facing product surface: bootstrap, sign-in/sign-up/SSO, onboarding wizards, interface map by persona/task |
 
 ## How this was produced
 

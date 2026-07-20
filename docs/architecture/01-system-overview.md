@@ -238,6 +238,7 @@ touch it*.
 | 13 | [ai-labs / archestra-bench](./13-ai-labs-benchmark.md) | Internal agentic eval harness |
 | 14 | [Migration Kit](./14-migration-kit.md) | Migrating other agent setups into Archestra |
 | 15 | [Design Decisions & Tradeoffs](./15-design-decisions-and-tradeoffs.md) | Cross-cutting decisions log |
+| 16 | [User Onboarding & Interfaces](./16-user-onboarding-and-interfaces.md) | Bootstrap, sign-in/sign-up/SSO, onboarding wizards, interface map by persona |
 
 Each file is self-contained and cites concrete repo-relative file paths so you can jump straight into
 the code; none of them attempt to restate the product docs in `docs/pages/` — read those first if you
