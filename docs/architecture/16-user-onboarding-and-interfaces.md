@@ -340,8 +340,10 @@ A few gating specifics worth calling out because they diverge from a simple admi
    model, or "Skip for now." This sets `organization.defaultModelId` — the fallback every built-in
    background subagent (title generation, context compaction, dual-LLM) resolves to.
 4. The chat composer opens. Go to `/mcp/registry` (or the catalog at `/mcp/registry/catalog`) to install an
-   MCP server; newly installed tools are **not** auto-assigned to any agent, so visit `/agents` (or the
-   assignment UI surfaced from the registry) to attach tools to an agent.
+   MCP server — see [§6 below](#6-bootstrapping-an-mcp-server-from-catalog-to-running-tool) for what
+   actually happens between clicking Install and the server being usable; newly installed tools are
+   **not** auto-assigned to any agent, so visit `/agents` (or the assignment UI surfaced from the
+   registry) to attach tools to an agent.
 5. Optionally author white-labeling and an onboarding wizard at `/settings/organization` — logo, theme,
    app name, chat links, and the multi-page Markdown wizard members will see on their own first `/chat`
    visit.
@@ -373,7 +375,133 @@ A few gating specifics worth calling out because they diverge from a simple admi
    naming the exact missing permission (`agent:read`) rather than a generic 403 — the one place in this
    flow where a permission gap is surfaced by name in the product UI itself.
 
+## 6. Bootstrapping an MCP server: from catalog to running tool
+
+Step 4 of the admin walkthrough above ("install an MCP server") is doing a lot of work in one sentence.
+This section unpacks what actually happens between clicking Install and an agent being able to call a
+tool — the mechanics of *why* it's a multi-second, asynchronous process rather than an instant toggle.
+For the Kubernetes-side deployment lifecycle itself (Deployment/Service/Secret shape, readiness polling,
+transports), see [MCP Gateway & Orchestrator](./05-mcp-gateway-and-orchestrator.md#k8s-orchestrator-design-pod-per-server);
+this section is about the *request/response and UI-visible* journey layered on top of it.
+
+**The install call returns before the server is usable.** `POST /api/mcp_server`
+(`backend/src/routes/mcp-server.ts`, `RouteId.InstallMcpServer`) resolves the catalog item, runs
+scope/duplicate/trust checks (see below), inserts the `mcp_server` row, and — for a **local** catalog
+item — calls `McpServerRuntimeManager.startServer()` to kick off the Kubernetes Deployment, then returns
+the newly created row to the client immediately with `localInstallationStatus: "pending"`. It does not
+wait for the pod to become ready or for tools to be discovered; that happens in a detached background
+task the same request handler kicks off (an IIFE, not a queued job), which:
+
+1. Waits for the Deployment to report ready (`waitForDeploymentReady`, up to 60 × 2s ≈ 2 minutes).
+2. Flips status to `discovering-tools` and calls the running server's own `tools/list` to persist its
+   tool catalog (`ToolModel`).
+3. Flips status to `success` (tools discovered and stored) or `error` (with `localInstallationError` set
+   to a human-readable reason — deployment timeout, tool discovery failure, etc.).
+
+Every status transition (`idle → pending → discovering-tools → success | error`,
+`LOCAL_MCP_INSTALLATION_STATES` in `platform/shared/websocket.ts`) is **pushed over the existing
+WebSocket connection** (`broadcastMcpInstallationStatus`) rather than requiring the frontend to poll —
+`GET /api/mcp_server/:id/installation-status` exists specifically as the initial-paint fallback ("for
+polling during local server installation," per its own route description) for whichever client opens the
+registry page after the WebSocket push already fired.
+
+**Remote servers skip almost all of this.** A **remote** catalog item (an HTTP MCP endpoint Archestra
+doesn't run) has no Deployment to wait on: the install path creates any needed credential (a Kubernetes
+Secret is *not* involved here — remote credentials go through the platform's own secret manager, plus an
+OAuth token exchange if the catalog item requires it) and validates connectivity inline, in the same
+request/response cycle. There is no `pending`/`discovering-tools` interstitial state for a remote server
+in the UI — it's synchronously either installed or rejected.
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Registry as "/mcp/registry UI"
+    participant API as "POST /api/mcp_server"
+    participant Runtime as "McpServerRuntimeManager"
+    participant K8s as "Kubernetes<br/>(Deployment/Service/Secret)"
+    participant Server as "MCP server pod"
+    participant WS as "WebSocket"
+
+    Admin->>Registry: Pick catalog item, click Install
+    Registry->>API: POST /api/mcp_server (catalogId, scope, config)
+    API->>API: scope/duplicate/trust checks
+
+    alt catalog item is local
+        API->>API: insert mcp_server row (status: pending)
+        API->>WS: broadcast "pending"
+        API->>Runtime: startServer()
+        Runtime->>K8s: create Deployment + Service + Secret
+        API-->>Registry: 200 OK (server row, status: pending)
+        Registry->>Admin: Show "Installing..." (live via WebSocket, not polling)
+
+        Note over API,Server: Background task, not part of the HTTP response
+        API->>K8s: waitForDeploymentReady() (poll up to 2 min)
+        K8s-->>API: pod Ready
+        API->>API: status: discovering-tools
+        API->>WS: broadcast "discovering-tools"
+        API->>Server: tools/list
+        Server-->>API: tool definitions
+        API->>API: persist tools, status: success (or error)
+        API->>WS: broadcast "success" / "error"
+        WS-->>Registry: status update
+        Registry->>Admin: "Installed" (tools now visible, not yet assigned)
+    else catalog item is remote
+        API->>API: create credential (secret / OAuth token exchange)
+        API->>Server: validate connectivity
+        Server-->>API: OK
+        API-->>Registry: 200 OK (server row, status: success — synchronous)
+        Registry->>Admin: "Installed"
+    end
+```
+
+**Install-time gates, before any Kubernetes or network call happens:**
+
+- **Scope authorization.** Installing at `team`/`org` scope on a `team`-scoped catalog item requires a
+  catalog-modify permission the installing user may not have — `validateScopeAndAuthorization` /
+  `requireMcpCatalogModifyPermission` reject before any secret is created or deployment started.
+- **Personal installs are idempotent, team/org installs are not.** Re-installing a catalog item you've
+  already personally installed doesn't error — it finds your existing install, re-attaches the catalog's
+  tools to whichever agent(s) you specify, and returns the existing row. Attempting a *second* team or
+  org install of the same catalog item, by contrast, is a hard `400` ("This team already has an
+  installation of this MCP server") — team/org scope is meant to be singular per catalog item.
+- **Trusted-image gate.** A personal local catalog item running a custom (non-catalog-default) Docker
+  image is checked against the governing environment's trusted-registry allowlist
+  (`assertInstallAllowedOrBlock`) *before* any secret or Deployment work — an untrusted image is blocked
+  outright (`403`) and recorded as pending admin approval, distinct from the installation-request
+  workflow below.
+- **Environment config allowlist.** Free-text (non-secret) config values a user supplies at install time
+  are validated against the governing environment's allowlist regex (`assertValuesMatchEnvironmentRegex`)
+  — an environment can restrict what values are even syntactically acceptable before the value ever
+  reaches a container's env vars.
+- **Multitenant catalogs** share one Deployment/Service/Secret across every installer (named by catalog
+  ID, not per-install ID) — the second, third, ... person to install a multitenant catalog item triggers
+  no new Kubernetes resources at all, just a new `mcp_server` row pointing at the same running pod.
+
+**What "installed" does not mean.** A `success` status means the pod is ready and its tools are known to
+Archestra — it does not mean any agent can use them yet. As already noted in the interface map above,
+newly discovered tools are never auto-assigned; an admin (or a member with `agent:team-admin`) still has
+to explicitly attach them to an agent before a chat conversation can call them. For a member without
+install rights on a shared-scope catalog item, this whole flow is gated behind the **installation-request
+workflow** instead (`POST /api/mcp_server_installation_requests` → admin
+`approve`/`decline`) — see [MCP Gateway & Orchestrator](./05-mcp-gateway-and-orchestrator.md#private-registry--installation-request-workflow)
+for the request/approval mechanics; only after approval does the sequence above ever run.
+
 ## Design Decisions & Tradeoffs
+
+**Local MCP server install returns immediately; readiness and tool discovery happen in a detached
+background task, pushed to the UI over WebSocket rather than polled.**
+*Rationale*: waiting on a Kubernetes Deployment to become ready (up to 2 minutes) inside the HTTP request
+that creates it would hold the connection open for a user-hostile amount of time and couples the API's
+response latency to cluster scheduling latency outside Archestra's control. Returning the row immediately
+with a `pending` status and pushing every subsequent transition over the same WebSocket connection the
+frontend already holds keeps the registry UI responsive and live without the frontend having to run its
+own poll loop — the `GET .../installation-status` route exists only as a cold-start fallback for whichever
+client didn't have the WebSocket connection open yet when the first push fired.
+*Cost*: the install path now has two failure surfaces instead of one — the synchronous `POST` can fail
+fast (bad scope, duplicate, blocked image), but a *background* failure (deployment timeout, `tools/list`
+erroring against a pod that came up but isn't behaving as an MCP server) only ever surfaces as a status
+flip to `error` sometime later, which means "the install call succeeded" and "the server is actually
+usable" are two different, time-separated facts a caller (UI or API client) has to check for separately.
 
 **Invitation-gated sign-up, no self-service registration.**
 *Rationale*: `AuthPageWithInvitationCheck` hard-blocks `/auth/sign-up` without an `invitationId` — there is
