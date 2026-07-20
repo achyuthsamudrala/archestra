@@ -11,24 +11,25 @@ flowchart TB
     Conv["Chat conversation"] --> Agent["Agent<br/>(system prompt + model +<br/>assigned MCP tools + Skills)"]
     Agent -->|"model emits a tool call —<br/>no special-cased path"| Gateway["MCP Gateway<br/>(auth, RBAC, tool/trusted-data policies)"]
 
-    Gateway --> External["External MCP tool<br/>→ remote server / K8s pod"]
-    Gateway --> BuiltIn["archestra__* built-in tools<br/>(Archestra's own MCP server)"]
+    subgraph Backend["Backend process (Node.js) — the caller"]
+        Gateway --> External["External MCP tool dispatch<br/>→ remote server / K8s pod<br/>(a separate runtime — see below —<br/>never touches Dagger)"]
+        Gateway --> BuiltIn["archestra__* tool handlers<br/>(ordinary TS code — incl. run_command's<br/>own handler — not itself sandboxed)"]
+        BuiltIn --> Orchestration["Skill Sandbox Runtime<br/>(TS orchestration + Rust/NAPI sandbox-core)"]
+        Orchestration --> PG[("Postgres<br/>ordered replay log — source of truth")]
+    end
 
-    BuiltIn --> LoadSkill["load_skill<br/>(skill:read)"]
-    BuiltIn --> Exec["run_command / upload_file / download_file<br/>(sandbox:execute)"]
-    BuiltIn --> Files["search_files / read_file / save_file /<br/>edit_file / delete_file<br/>(file:manage)"]
+    subgraph Sandbox["Dagger container — the sandbox itself"]
+        Payload["The model's command/script text<br/>(run_command's 'command' argument)"]
+        SkillFiles["Mounted skill files<br/>/skills/&lt;name&gt;"]
+        Payload -.->|"reads / imports / executes"| SkillFiles
+    end
 
-    LoadSkill -->|"mounts pinned version<br/>at /skills/&lt;name&gt;"| Runtime
-    Exec --> Runtime["Skill Sandbox Runtime"]
-    Files --> Runtime
-
-    Runtime --> PG[("Postgres<br/>ordered replay log — source of truth")]
-    Runtime --> Rust["archestra-rs/sandbox-core<br/>(Rust, NAPI-bound)"]
-    Rust --> Dagger["Dagger engine<br/>disposable containers, rebuilt from the log"]
+    Orchestration -->|"materializes a fresh container<br/>from the replay log, then executes"| Payload
 ```
 
 A few things this makes concrete:
 
+- **The tool handler is the caller, not the payload — this is the point most worth getting right.** `archestra__*` tool handlers, *including `run_command`'s own handler*, run as ordinary backend TypeScript code in the same Node.js process as the MCP Gateway. None of that code executes inside Dagger. What actually runs inside the Dagger container is the *argument* the model passed — the `command` string given to `run_command` — most often a call into a skill's bundled script mounted at `/skills/<name>`, but just as easily ad-hoc code the model wrote on the spot. Installed MCP servers (a GitHub server, a Slack server, anything from the registry) are a *different* execution path entirely: local ones get their own Kubernetes pod ([MCP Gateway & Orchestrator](./05-mcp-gateway-and-orchestrator.md)), remote ones run on a third party's infrastructure — neither ever touches Dagger, regardless of which tool triggered them.
 - **No new interface, same enforcement points.** A model calling `run_command` looks, to the MCP Gateway, exactly like a model calling a remote server's tool — same auth, same RBAC (`sandbox:execute`/`file:manage`, see [Fail-closed re-checks](#fail-closed-re-checks) below), same logging. The sandbox adds no bypass and no shortcut; it's a *destination* behind the gateway, not an alternate path around it.
 - **Why it has to exist at all.** A Skill on its own is inert — SKILL.md text plus bundled files, loaded into context by `load_skill` the same way a system prompt is assembled (see [What a Skill is](#what-a-skill-is) below). Nothing about that act *runs* anything. The sandbox is what turns "here are some bundled scripts" into "here is a filesystem where those scripts execute," scoped to one conversation.
 - **Skills plug in at exactly one point.** `load_skill` mounts a skill's pinned, immutable version into the sandbox at `/skills/<name>` — itself just another entry in the same replay log `run_command` and `upload_file` write to (see [The sandbox execution model](#the-sandbox-execution-model)). This is why *authoring* a skill (`create_skill`/`update_skill`, pure Postgres writes) and *running* a skill's code (`load_skill` + `run_command`, sandbox execution) are cleanly separable concerns that happen to compose through one mount step.
