@@ -2,6 +2,39 @@
 
 This document covers three related but distinct concepts in the codebase: **Agents** (the unified runtime entity chat, MCP gateways, and LLM proxies all resolve to), **Skills** (versioned, reusable SKILL.md instruction sets a model can load into context), and the **Skill Sandbox Runtime** (a DB-backed, Dagger-materialized execution environment skills and agents can run code in). Paths are relative to `platform/backend/src/` and `platform/archestra-rs/` unless noted. For the guardrails that gate what an agent's tools are allowed to do once running, see [Security & Guardrails](./06-security-and-guardrails.md).
 
+## How this fits into the system
+
+The rest of this document goes deep on schema and Dagger internals before it says what the sandbox is actually *for* — worth fixing with the picture up front. The single most important fact: **the sandbox is not a separate subsystem a model talks to directly. It's a code-execution backend exposed through ordinary MCP tools**, sitting behind Archestra's own built-in MCP server exactly the way a remote MCP server sits behind the MCP Gateway.
+
+```mermaid
+flowchart TB
+    Conv["Chat conversation"] --> Agent["Agent<br/>(system prompt + model +<br/>assigned MCP tools + Skills)"]
+    Agent -->|"model emits a tool call —<br/>no special-cased path"| Gateway["MCP Gateway<br/>(auth, RBAC, tool/trusted-data policies)"]
+
+    Gateway --> External["External MCP tool<br/>→ remote server / K8s pod"]
+    Gateway --> BuiltIn["archestra__* built-in tools<br/>(Archestra's own MCP server)"]
+
+    BuiltIn --> LoadSkill["load_skill<br/>(skill:read)"]
+    BuiltIn --> Exec["run_command / upload_file / download_file<br/>(sandbox:execute)"]
+    BuiltIn --> Files["search_files / read_file / save_file /<br/>edit_file / delete_file<br/>(file:manage)"]
+
+    LoadSkill -->|"mounts pinned version<br/>at /skills/&lt;name&gt;"| Runtime
+    Exec --> Runtime["Skill Sandbox Runtime"]
+    Files --> Runtime
+
+    Runtime --> PG[("Postgres<br/>ordered replay log — source of truth")]
+    Runtime --> Rust["archestra-rs/sandbox-core<br/>(Rust, NAPI-bound)"]
+    Rust --> Dagger["Dagger engine<br/>disposable containers, rebuilt from the log"]
+```
+
+A few things this makes concrete:
+
+- **No new interface, same enforcement points.** A model calling `run_command` looks, to the MCP Gateway, exactly like a model calling a remote server's tool — same auth, same RBAC (`sandbox:execute`/`file:manage`, see [Fail-closed re-checks](#fail-closed-re-checks) below), same logging. The sandbox adds no bypass and no shortcut; it's a *destination* behind the gateway, not an alternate path around it.
+- **Why it has to exist at all.** A Skill on its own is inert — SKILL.md text plus bundled files, loaded into context by `load_skill` the same way a system prompt is assembled (see [What a Skill is](#what-a-skill-is) below). Nothing about that act *runs* anything. The sandbox is what turns "here are some bundled scripts" into "here is a filesystem where those scripts execute," scoped to one conversation.
+- **Skills plug in at exactly one point.** `load_skill` mounts a skill's pinned, immutable version into the sandbox at `/skills/<name>` — itself just another entry in the same replay log `run_command` and `upload_file` write to (see [The sandbox execution model](#the-sandbox-execution-model)). This is why *authoring* a skill (`create_skill`/`update_skill`, pure Postgres writes) and *running* a skill's code (`load_skill` + `run_command`, sandbox execution) are cleanly separable concerns that happen to compose through one mount step.
+- **Postgres is truth, Dagger is a rebuildable cache** — the same "derived, disposable execution layer over a durable database record" shape used for the MCP orchestrator's Kubernetes pods (see [MCP Gateway & Orchestrator](./05-mcp-gateway-and-orchestrator.md#k8s-orchestrator-design-pod-per-server)). Nothing about a sandbox's correctness depends on any particular container surviving; see [Why replay, not persistent containers](#why-replay-not-persistent-containers).
+- **Rust exists here for robustness, not speed.** The actual Dagger SDK calls, container-graph construction, and session-pool management live in `archestra-rs/sandbox-core`, exposed to the TypeScript backend via NAPI. That boundary buys panic containment and direct control over a spawned `dagger session` process's lifecycle — awkward properties to get from pure TypeScript glue code. See [The Rust layer vs the TypeScript layer](#the-rust-layer-vs-the-typescript-layer) below and [Native Rust Components](./09-native-rust-components.md) for the general NAPI pattern.
+
 ## What an Agent is
 
 There is exactly one `agents` table (`database/schemas/agent.ts`) behind four different-looking surfaces, distinguished by `agentType`:
